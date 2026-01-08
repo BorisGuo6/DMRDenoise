@@ -142,3 +142,4 @@ dmypy.json
 /trained
 /render_outputs
 /*.xyz
+*.zip

@@ -26,7 +26,7 @@ def run_denoise(pc, patch_size, ckpt, device, random_state=0, expand_knn=16):
     print('[INFO] Center: %s | Scale: %.6f' % (repr(center), scale))
 
     n_clusters = math.ceil(pc.shape[0] / patch_size)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_jobs=16).fit(pc)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state).fit(pc)
 
     knn_graph = kneighbors_graph(pc, n_neighbors=expand_knn, mode='distance', include_self=False, n_jobs=8)
     knn_idx = np.array(knn_graph.tolil().rows.tolist())
@@ -65,6 +65,90 @@ def run_denoise(pc, patch_size, ckpt, device, random_state=0, expand_knn=16):
 
     return denoised, downsampled
 
+def farthest_points(data,
+                    nclusters,
+                    dist_func,
+                    return_center_indexes=False,
+                    return_distances=False,
+                    verbose=False):
+    """
+      Performs farthest point sampling on data points.
+      Args:
+        data: numpy array of the data points.
+        nclusters: int, number of clusters.
+        dist_dunc: distance function that is used to compare two data points.
+        return_center_indexes: bool, If True, returns the indexes of the center of 
+          clusters.
+        return_distances: bool, If True, return distances of each point from centers.
+
+      Returns clusters, [centers, distances]:
+        clusters: numpy array containing the cluster index for each element in 
+          data.
+        centers: numpy array containing the integer index of each center.
+        distances: numpy array of [npoints] that contains the closest distance of 
+          each point to any of the cluster centers.
+    """
+    if nclusters >= data.shape[0]:
+        if return_center_indexes:
+            return np.arange(data.shape[0],
+                             dtype=np.int32), np.arange(data.shape[0],
+                                                        dtype=np.int32)
+
+        return np.arange(data.shape[0], dtype=np.int32)
+
+    clusters = np.ones((data.shape[0], ), dtype=np.int32) * -1
+    distances = np.ones((data.shape[0], ), dtype=np.float32) * 1e7
+    centers = []
+
+    for iter in range(nclusters):
+        index = np.argmax(distances)
+        centers.append(index)
+        shape = list(data.shape)
+        for i in range(1, len(shape)):
+            shape[i] = 1
+
+        broadcasted_data = np.tile(np.expand_dims(data[index], 0), shape)
+        new_distances = dist_func(broadcasted_data, data)
+        distances = np.minimum(distances, new_distances)
+        clusters[distances == new_distances] = iter
+
+        if verbose:
+            print('farthest points max distance : {}'.format(
+                np.max(distances)))
+
+    if return_center_indexes:
+        if return_distances:
+            return clusters, np.asarray(centers, dtype=np.int32), distances
+        return clusters, np.asarray(centers, dtype=np.int32)
+    return clusters
+
+def distance_by_translation_point(p1, p2):
+    """
+      Gets two nx3 points and computes the distance between point p1 and p2.
+    """
+    return np.sqrt(np.sum(np.square(p1 - p2), axis=-1))
+
+
+def regularize_pc_point_count(pc, npoints, use_farthest_point=False):
+    """
+      If point cloud pc has less points than npoints, it oversamples.
+      Otherwise, it downsample the input pc to have npoint points.
+      use_farthest_point: indicates whether to use farthest point sampling
+      to downsample the points. Farthest point sampling version runs slower.
+    """
+    
+    if pc.shape[0] > npoints:
+        if use_farthest_point:
+            _, center_indexes = farthest_points(pc, npoints, distance_by_translation_point, return_center_indexes=True)
+        else:
+            center_indexes = np.random.choice(range(pc.shape[0]), size=npoints, replace=False)
+        pc = pc[center_indexes, :]
+    else:
+        required = npoints - pc.shape[0]
+        if required > 0:
+            index = np.random.choice(range(pc.shape[0]), size=required)
+            pc = np.concatenate((pc, pc[index, :]), axis=0)
+    return pc
 
 def run_denoise_middle_pointcloud(pc, num_splits, patch_size, ckpt, device, random_state=0, expand_knn=16):
     np.random.shuffle(pc)
@@ -137,7 +221,7 @@ def run_test(input_fn, output_fn, patch_size, ckpt, device, random_state=0, expa
 
 def auto_denoise(args):
     print('[INFO] Loading: %s' % args.input)
-    pc = np.loadtxt(args.input).astype(np.float32)
+    pc = np.load(args.input).astype(np.float32)
     if not os.path.exists(os.path.dirname(args.output)):
         os.makedirs(os.path.dirname(args.output))
     
@@ -177,10 +261,15 @@ def auto_denoise(args):
     else:
         assert False, "Our pretrained model does not support point clouds with less than 10K points."
 
-    np.savetxt(args.output, denoised)
+    print(type(denoised))
+    denoised_array = np.array(denoised)
+    print(denoised_array.shape)
+
+    denoised_array = regularize_pc_point_count(denoised_array, 400, use_farthest_point=args.freg)
+    np.save(args.output, denoised_array)
     print('[INFO] Saving to: %s' % args.output)
-    if args.downsample_output is not None:
-        np.savetxt(args.downsample_output, downsampled)
+    # if args.downsample_output is not None:
+    #     np.savetxt(args.downsample_output, downsampled)
 
 
 if __name__ == '__main__':
@@ -197,6 +286,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_splits', type=int, default=2,
                         help='Number of splits for middle-sized point clouds.')
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--freg', type=bool, default=True)
     args = parser.parse_args()
     
     auto_denoise(args)
